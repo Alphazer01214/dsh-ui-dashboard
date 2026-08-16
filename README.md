@@ -15,3 +15,4 @@ None; this package neither assembles nor sends a provider request.
 ## Known Limitations and Deferred Work
 
 - **Scope is the live session list** — totals fold the list mirror the runtime keeps, so sessions outside it (archived or unloaded workspaces) do not count, and the table carries folded totals only, with no per-day history or trends.
+- **Model labels for sessions checkpointed before the label existed** — the model cell reads the `tokenUsage` projection's newest `request/header`, so a session last checkpointed before the label shipped keeps its model cell blank until the session is opened (tail replay refolds the label) or next checkpointed. Token totals are unaffected.
