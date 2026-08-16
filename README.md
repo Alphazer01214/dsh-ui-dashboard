@@ -4,6 +4,10 @@ English | [中文](README.zh.md)
 
 Usage dashboard for the DeepSeek Harness web sidebar: one footer action beside Settings that folds the session list's retained projection values — the durable `tokenUsage` buckets and the whole-log `sessionStats` counts — into cross-session totals. The trigger renders the sidebar's compact row while the column is wide and the rail circle while collapsed; both open the same modal dialog. The plugin issues no RPC and holds no state beyond dialog visibility and the trend window selection: every read goes through the standard `useSessions` hook over the list mirror the runtime already keeps. [REPO.md](REPO.md) records how this repository relates to the deepseek-harness monorepo.
 
+## Screenshots
+
+![Usage dashboard in the light theme](assets/dashboard-light.png)
+
 ## What it shows
 
 - **Stat cards.** Total, billed input, output, cache-hit share, cache read/write, turns, steps, LLM and tool wall time, and average decode throughput. A card whose figure is zero or unavailable drops out whole.
