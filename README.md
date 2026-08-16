@@ -1,32 +1,104 @@
-# @deepseek-ai/dsh-usage-dashboard
+# dsh-usage-dashboard
 
 English | [中文](README.zh.md)
 
-Usage dashboard for the DeepSeek Harness web sidebar: one footer action beside Settings that folds the session list's retained projection values — the durable `tokenUsage` buckets and the whole-log `sessionStats` counts — into cross-session totals. The trigger renders the sidebar's compact row while the column is wide and the rail circle while collapsed; both open the same modal dialog. The plugin issues no RPC and holds no state beyond dialog visibility and the trend window selection: every read goes through the standard `useSessions` hook over the list mirror the runtime already keeps. [REPO.md](REPO.md) records how this repository relates to the deepseek-harness monorepo.
+A usage dashboard for DeepSeek Harness web deployments, shipped as a **dynamic
+Cordis plugin** (one host half, one browser half). It replaces the sidebar's
+built-in usage dialog with a durable, deployment-wide usage ledger that fixes
+the built-in dashboard's four structural problems:
 
-## Screenshots
+1. **No manual expansion.** The built-in dashboard folds only the sessions the
+   browser has loaded. This plugin backfills every persisted session straight
+   from the session logs at activation, then folds every committed event live —
+   nothing needs to be opened first.
+2. **Deleting a conversation never reduces the totals.** The ledger lives in its
+   own storage domain (`usage_dashboard` in the harness storage root),
+   completely separate from the session logs and their projection caches.
+3. **Backup and migration.** The dialog exports the whole ledger as one JSON
+   document and imports it again — importing into a fresh deployment restores
+   the full history, and re-importing the same backup never double counts.
+4. **Exact numbers — no more, no less.** The fold mirrors the harness's own
+   `tokenUsage` / `sessionStats` projection semantics field-for-field (verified
+   against the harness folds over randomized event sequences): same-step usage
+   samples replace instead of adding, fork/subagent seed prefixes are skipped so
+   an ancestor's history is counted exactly once, and every write is
+   cross-checked against the live `tokenUsage` projection with a loud mismatch
+   log.
 
-![Usage dashboard in the light theme](assets/dashboard-light.png)
+It also records the **models used by subagents** (each subagent is its own
+session, attributed to its parent), and draws the usage trend **per day** —
+stacked input/output bars plus a cumulative line, with 7-day / 30-day / all
+windows.
 
-## What it shows
+## Requirements
 
-- **Stat cards.** Total, billed input, output, cache-hit share, cache read/write, turns, steps, LLM and tool wall time, and average decode throughput. A card whose figure is zero or unavailable drops out whole.
-- **Usage trend chart.** One bar per session at its real `updatedAt` position, scaled to the tallest session inside a selectable time window (7 days / 30 days / all), with labeled axes: the y ticks read 0 / half / max in compact token form and the x labels name the window's start and end dates.
-- **Per-session table.** Sorted newest first: session, newest billed model, turns/steps, and the input/output/total token columns. Turns/steps stay blank (`—`) while a session serves no `sessionStats` value, and the model cell stays blank while a session serves no `tokenUsage` value.
+A DeepSeek Harness **web-profile** deployment that mounts `storage-domain` and
+`session-persistence` (the standard web bundle does). The plugin reads only
+public services — it changes no harness code.
+
+## Loading the plugin
+
+The plugin is a dynamic Cordis package. In the harness GUI (or via the cordis
+API): define a package whose **host half is `src/host.js`** and whose **client
+half is `src/client.js`**, then run it and approve the browser half. The sidebar
+"用量" action now opens the ledger-backed dashboard (it replaces the built-in
+entry in `sidebar.footer.action`; stopping the plugin restores the built-in
+one).
+
+## What the dialog shows
+
+- **Stat cards** — total / input / output tokens, cache-hit share, cache
+  read/write, session count, turns, steps, LLM and tool wall time, decode
+  throughput.
+- **Usage trend (per day)** — stacked input/output bars with a cumulative
+  line, legend, dashed gridlines, sparse date ticks, and window selection.
+- **Model usage** — per-model totals including the models subagents billed,
+  with distinct-session counts.
+- **Session table** — per-session tokens, newest billed model, turns/steps,
+  with a 子代理 badge for subagent sessions.
+- **Backup & migration** — export (copy the JSON document to a file) and
+  import (paste a backup and merge it).
 
 ## Data semantics
 
-All figures are whole-log durable numbers, so paging and compaction cannot change them. Input is the sum of the three disjoint prompt-side buckets (`uncachedInputTokens`, `cacheReadTokens`, `cacheWriteTokens`); total adds `outputTokens`. The model label is the provider-owned model id of the newest `request/header`, last-wins, so a mid-session switch labels the totals with the newest billed route. The trend chart folds per-session totals at their real `updatedAt` positions; the time window filters and re-scales that fold.
+- Each ledger record is keyed by `sessionId@createdAt` and carries the folded
+  state (per-day and per-model token buckets, turns/steps/timings, newest
+  billed model) plus a seq watermark. Records only ever advance: writes are
+  serialized per key and a lower-watermark snapshot can never regress a stored
+  record.
+- A session's own suffix starts at its header's `seedLength`: fork and
+  subagent children count exactly what they themselves billed, and the
+  inherited prefix stays attributed to the ancestor — the totals are the true
+  billed usage with no double counting anywhere in a fork tree.
+- Live sessions fold through `session/event` with `{ global: true }` listeners
+  (a dynamic package mounts in the requesting session's agent scope; without
+  the flag other conversations' events would never reach it). Activation heals
+  every stored tail, materializes live cells, and `usage.report` additionally
+  backfills any session the ledger has never seen, so the report is complete
+  even for sessions created while the plugin was stopped.
+- The backup document is `{ format: 'dsh-usage-dashboard-backup', version: 1,
+  exportedAt, records }`. Import validates every record and merges by key: a
+  record is adopted only when its seq is higher than the stored one, so
+  repeated imports are idempotent.
 
-## Model Experience
+## Known limitations
 
-None, as the dashboard renders already-logged projection values in the browser; nothing here reaches a model request.
+- **Process-local.** Dynamic plugins do not survive a harness restart: re-run
+  the package after restarting. The ledger itself is durable, so the numbers
+  continue seamlessly on the next activation.
+- **Backup travels as text.** Export renders the JSON document in a textarea
+  (copy it to a file); import accepts the same JSON pasted back.
+- **Day buckets use the host's local calendar.** Totals never depend on the
+  bucket; only the trend chart's grouping does.
+- **Sessions whose logs were deleted before the plugin ever ran** cannot be
+  reconstructed — there is nothing left to fold. Everything present in the
+  store is counted.
+- Per-session titles are joined from the live session list when available;
+  sessions no longer in the list (e.g. deleted) show a short id.
 
-#### KV Cache effect
+## Repository layout
 
-None; this package neither assembles nor sends a provider request.
-
-## Known Limitations and Deferred Work
-
-- **Scope is the live session list** — totals fold the list mirror the runtime keeps, so sessions outside it (archived or unloaded workspaces) do not count. The trend chart has no per-day bucketing and no within-session series.
-- **Model labels for sessions checkpointed before the label existed** — the model cell reads the `tokenUsage` projection's newest `request/header`, so a session last checkpointed before the label shipped keeps its model cell blank until the session is opened (tail replay refolds the label) or next checkpointed. Token totals are unaffected.
+- `src/host.js` — the exact `code.host` function body (ledger, heal/backfill,
+  report/export/import RPC).
+- `src/client.js` — the exact `code.client` function body (sidebar action and
+  dialog).
