@@ -3,7 +3,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it } from 'vitest'
 import { SlotRegistry } from '@deepseek-ai/dsh-client-runtime/client'
 import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
-import { apply, inject } from '@deepseek-ai/dsh-client-ui-dashboard/client'
+import { apply, inject } from '@deepseek-ai/dsh-usage-dashboard/client'
 
 async function bench(declare = true) {
   const ctx = new Context()
@@ -25,7 +25,7 @@ async function bench(declare = true) {
   return { ctx, slots }
 }
 
-describe('ui-dashboard apply', () => {
+describe('usage-dashboard apply', () => {
   it('declares only the services it uses', () => {
     expect(inject).toEqual(['slots', 'locale'])
   })

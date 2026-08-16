@@ -27,7 +27,7 @@ export const inject = ['slots', 'locale']
  * @param ctx - client root context.
  */
 export function apply(ctx: ClientContext): void {
-  ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'ui-dashboard: dictionaries')
+  ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'usage-dashboard: dictionaries')
   ctx.slots.inject(
     'sidebar.footer.action',
     () => ctx.slots.register({
