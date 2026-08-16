@@ -1,9 +1,10 @@
 /**
  * Sidebar-foot usage dashboard: a trigger row plus a modal that folds the
  * retained `tokenUsage` / `sessionStats` projection values of every session
- * list row into cross-session totals and a per-session table (session, newest
- * billed model, turns/steps, and the three token columns). All figures are
- * whole-log durable numbers, so paging and compaction cannot change them.
+ * list row into cross-session totals, a per-session usage trend chart, and a
+ * per-session table (session, newest billed model, turns/steps, and the three
+ * token columns). All figures are whole-log durable numbers, so paging and
+ * compaction cannot change them.
  */
 
 import { useMemo, useState } from 'react'
@@ -156,6 +157,48 @@ interface StatCard {
   value: string
 }
 
+const TREND_HEIGHT = 120
+const TREND_WIDTH = 600
+const TREND_BAR_GAP = 2
+
+/**
+ * Per-session usage trend over the list's updatedAt order (oldest first): one
+ * bar per row, height proportional to `totalTokens`, with the session title
+ * and formatted count as each bar's tooltip. The list mirror carries no
+ * time-bucketed series, so this is a per-session trend, never per-day.
+ * @param rows - display rows, newest first as {@link dashboardRows} returns them.
+ * @param title - section heading and accessible name for the chart image.
+ * @returns the heading plus chart, or null when every row bills zero tokens.
+ */
+function TrendChart({ rows, title }: { rows: readonly DashboardRow[]; title: string }) {
+  // The 0 floor doubles as the empty-rows case (Math.max of no spread args).
+  const max = Math.max(...rows.map(row => row.totalTokens), 0)
+  if (max === 0) return null
+  const barWidth = Math.max(1, TREND_WIDTH / rows.length - TREND_BAR_GAP)
+  return (
+    <>
+      <h3 className={css.trendTitle}>{title}</h3>
+      <svg className={css.chart} viewBox={`0 0 ${TREND_WIDTH} ${TREND_HEIGHT}`} role="img" aria-label={title}>
+        {rows.map((row, index) => {
+          const barHeight = Math.max(1, Math.round(row.totalTokens / max * TREND_HEIGHT))
+          return (
+            <g key={row.id}>
+              <title>{`${row.title} · ${formatTokens(row.totalTokens)}`}</title>
+              <rect
+                x={index * (barWidth + TREND_BAR_GAP)}
+                y={TREND_HEIGHT - barHeight}
+                width={barWidth}
+                height={barHeight}
+                className={css.bar}
+              />
+            </g>
+          )
+        })}
+      </svg>
+    </>
+  )
+}
+
 /**
  * Render the sidebar footer trigger and the usage-dashboard modal.
  * @param props - composed slot props (wide column state, useSessions, locale).
@@ -231,6 +274,7 @@ export function DashboardAction({ wide, useSessions, t }: DashboardActionProps) 
                   </div>
                 ))}
               </div>
+              <TrendChart rows={rows} title={t('trend.title')} />
               <h3 className={css.tableTitle}>{t('table.title')}</h3>
               <div className={css.tableWrap}>
                 <table className={css.table}>

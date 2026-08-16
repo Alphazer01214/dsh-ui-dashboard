@@ -89,6 +89,25 @@
   color: var(--dsw-alias-label-primary);
 }
 
+.trendTitle {
+  margin: 20px 0 4px;
+  font-size: 14px;
+  line-height: 22px;
+  font-weight: 500;
+  color: var(--dsw-alias-label-primary);
+}
+
+.chart {
+  display: block;
+  width: 100%;
+  height: 120px;
+}
+
+.chart .bar {
+  fill: var(--dsw-alias-brand-primary);
+  fill-opacity: 0.85;
+}
+
 .tableWrap {
   max-height: 40vh;
   overflow: auto;

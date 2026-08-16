@@ -128,7 +128,7 @@ describe('dashboardRows / dashboardTotals', () => {
 })
 
 describe('DashboardAction', () => {
-  it('opens the dialog with cross-session cards and the per-session table', () => {
+  it('opens the dialog with cross-session cards, the trend chart, and the per-session table', () => {
     const byId = record({
       a: summary('a' as SessionId, 2, { tokenUsage: USAGE_A, sessionStats: STATS_A }),
       b: summary('b' as SessionId, 3, { tokenUsage: USAGE_B }),
@@ -146,6 +146,12 @@ describe('DashboardAction', () => {
     expect(screen.getByText('缓存命中').parentElement!.textContent).toContain('80%')
     expect(screen.getByText('LLM 时间').parentElement!.textContent).toContain('1 分 1 秒')
     expect(screen.getByText('平均吞吐').parentElement!.textContent).toContain('15 tok/s')
+    // The trend chart folds one bar per session, newest last. (The Modal
+    // portals to document.body, so the chart is queried off the img role.)
+    const chart = screen.getByRole('img', { name: '用量趋势' })
+    expect(chart.querySelectorAll('rect')).toHaveLength(2)
+    expect([...chart.querySelectorAll('title')].map(node => node.textContent))
+      .toEqual(['b · 3K', 'a · 10K'])
     // Per-session rows newest-first; b has no sessionStats so turns stay blank,
     // and no tokenUsage model so the model cell is blank too.
     expect(screen.getByText('b')).toBeTruthy()
@@ -164,6 +170,35 @@ describe('DashboardAction', () => {
     fireEvent.click(screen.getByRole('button', { name: '用量仪表盘' }))
     expect(screen.getByRole('dialog').textContent).toContain('还没有可统计的用量')
     expect(screen.queryByText('按会话')).toBeNull()
+    expect(screen.queryByRole('img', { name: '用量趋势' })).toBeNull()
+  })
+
+  it('hides the trend chart while no session bills any token', () => {
+    const byId = record({
+      statsOnly: summary('statsOnly' as SessionId, 1, { sessionStats: STATS_A }),
+    })
+    render(<DashboardAction {...props(byId)} />)
+    fireEvent.click(screen.getByRole('button', { name: '用量仪表盘' }))
+    expect(screen.getByRole('dialog').textContent).toContain('1 个会话')
+    expect(screen.queryByRole('img', { name: '用量趋势' })).toBeNull()
+    expect(screen.queryByText('用量趋势')).toBeNull()
+  })
+
+  it('keeps a 1px bar floor when the list outgrows the chart width', () => {
+    const byId: Record<SessionId, SessionSummary> = {}
+    for (let i = 0; i < 201; i++) {
+      const id = `s${i}` as SessionId
+      byId[id] = summary(id, i, {
+        tokenUsage: { uncachedInputTokens: 1, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      })
+    }
+    const view = render(<DashboardAction {...props(byId)} />)
+    fireEvent.click(screen.getByRole('button', { name: '用量仪表盘' }))
+    const chart = screen.getByRole('img', { name: '用量趋势' })
+    const widths = [...chart.querySelectorAll('rect')].map(rect => Number(rect.getAttribute('width')))
+    expect(widths).toHaveLength(201)
+    expect(widths.every(width => width === 1)).toBe(true)
+    view.unmount()
   })
 
   it('renders the rail trigger without the visible label', () => {
@@ -179,10 +214,15 @@ describe('DashboardAction', () => {
   it('formats megabyte-scale tokens and the seconds/hours duration branches', () => {
     const byId = record({
       big: summary('big' as SessionId, 4, { tokenUsage: USAGE_M, sessionStats: STATS_CLOCK }),
+      // 1 token beside 150M scales to a sub-pixel height: the bar keeps the
+      // 1px floor so a tiny session stays visible on the chart.
+      tiny: summary('tiny' as SessionId, 5, {
+        tokenUsage: { uncachedInputTokens: 1, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      }),
     })
     render(<DashboardAction {...props(byId)} />)
     fireEvent.click(screen.getByRole('button', { name: '用量仪表盘' }))
-    // 150_000_000 -> scaled 150 (>= 100) -> "150M".
+    // 150_000_001 -> scaled 150 (>= 100) -> "150M".
     expect(screen.getByText('总 token').parentElement!.textContent).toContain('150M')
     // 3_661_000 ms -> 1h 1m; 45_000 ms -> 45s.
     expect(screen.getByText('LLM 时间').parentElement!.textContent).toContain('1 时 1 分')
