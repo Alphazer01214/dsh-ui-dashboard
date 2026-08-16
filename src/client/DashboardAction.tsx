@@ -1,7 +1,8 @@
 /**
  * Sidebar-foot usage dashboard: a trigger row plus a modal that folds the
  * retained `tokenUsage` / `sessionStats` projection values of every session
- * list row into cross-session totals, a per-session usage trend chart, and a
+ * list row into cross-session totals, a per-session usage trend chart with a
+ * selectable time window (7 days / 30 days / all) and labeled axes, and a
  * per-session table (session, newest billed model, turns/steps, and the three
  * token columns). All figures are whole-log durable numbers, so paging and
  * compaction cannot change them.
@@ -16,7 +17,7 @@ import type {} from '@deepseek-ai/dsh-session-stats/client'
 import type {} from '@deepseek-ai/dsh-token-meter/client'
 // Type-only: merges the sidebar slot declarations the props derive from.
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
-import { NS } from './locales.ts'
+import { NS, type DashboardKey } from './locales.ts'
 import css from './DashboardAction.module.css'
 
 /** One per-session table row, already display-shaped. */
@@ -32,6 +33,8 @@ export interface DashboardRow {
   inputTokens: number
   outputTokens: number
   totalTokens: number
+  /** The session's list `updatedAt` (trend-chart time position). */
+  updatedAt: number
 }
 
 /** Cross-session sums; zero fields mean "no session reported that figure". */
@@ -110,6 +113,7 @@ export function dashboardRows(byId: Readonly<Record<SessionId, SessionSummary>>)
         inputTokens,
         outputTokens,
         totalTokens: inputTokens + outputTokens,
+        updatedAt: summary.updatedAt,
       }
     })
 }
@@ -159,42 +163,135 @@ interface StatCard {
 
 const TREND_HEIGHT = 120
 const TREND_WIDTH = 600
-const TREND_BAR_GAP = 2
+const TREND_PLOT_LEFT = 40
+const TREND_PLOT_RIGHT = 8
+const TREND_PLOT_TOP = 8
+const TREND_X_LABEL_HEIGHT = 18
+const DAY_MS = 86_400_000
+
+/** One selectable time window for the trend chart. */
+type TrendScale = 'all' | 'week' | 'month'
+
+const SCALE_OPTIONS: readonly { key: TrendScale; label: DashboardKey }[] = [
+  { key: 'week', label: 'trend.week' },
+  { key: 'month', label: 'trend.month' },
+  { key: 'all', label: 'trend.all' },
+]
+
+const SCALE_WINDOWS: Record<TrendScale, number> = {
+  week: 7 * DAY_MS,
+  month: 30 * DAY_MS,
+  all: 0,
+}
 
 /**
- * Per-session usage trend over the list's updatedAt order (oldest first): one
- * bar per row, height proportional to `totalTokens`, with the session title
- * and formatted count as each bar's tooltip. The list mirror carries no
- * time-bucketed series, so this is a per-session trend, never per-day.
+ * Per-session usage trend with a selectable time window and labeled axes: one
+ * bar per row at its real `updatedAt` position, height proportional to
+ * `totalTokens`, scaled to the tallest row inside the selected window. The y
+ * axis ticks 0 / half / max in compact token form; the x axis labels the
+ * window's start and end dates. The list mirror carries no time-bucketed
+ * series, so the chart is a per-session trend, never per-day. The window
+ * selection is component-local interaction state.
  * @param rows - display rows, newest first as {@link dashboardRows} returns them.
  * @param title - section heading and accessible name for the chart image.
- * @returns the heading plus chart, or null when every row bills zero tokens.
+ * @param t - the dashboard locale seat.
+ * @param now - current time in epoch milliseconds (window anchor).
+ * @returns the heading, scale selector, and chart; null when no row bills any token.
  */
-function TrendChart({ rows, title }: { rows: readonly DashboardRow[]; title: string }) {
+function TrendChart({ rows, title, t, now }: {
+  rows: readonly DashboardRow[]
+  title: string
+  t: TranslateNS<typeof NS>
+  now: number
+}) {
+  const [scale, setScale] = useState<TrendScale>('all')
   // The 0 floor doubles as the empty-rows case (Math.max of no spread args).
-  const max = Math.max(...rows.map(row => row.totalTokens), 0)
-  if (max === 0) return null
-  const barWidth = Math.max(1, TREND_WIDTH / rows.length - TREND_BAR_GAP)
+  const allMax = Math.max(...rows.map(row => row.totalTokens), 0)
+  if (allMax === 0) return null
+
+  const windowStart = scale === 'all' ? undefined : now - SCALE_WINDOWS[scale]
+  const visible = windowStart === undefined
+    ? rows
+    : rows.filter(row => row.updatedAt >= windowStart)
+  const max = Math.max(...visible.map(row => row.totalTokens), 0)
+  const plotWidth = TREND_WIDTH - TREND_PLOT_LEFT - TREND_PLOT_RIGHT
+  const plotHeight = TREND_HEIGHT - TREND_PLOT_TOP - TREND_X_LABEL_HEIGHT
+  const yOf = (value: number): number =>
+    TREND_PLOT_TOP + (1 - value / max) * plotHeight
+  const ticks = [...new Set([0, Math.round(max / 2), max])]
+  const dateLabel = (ms: number): string => {
+    const date = new Date(ms)
+    return t('trend.axis.date', { month: date.getMonth() + 1, day: date.getDate() })
+  }
+
   return (
     <>
       <h3 className={css.trendTitle}>{title}</h3>
-      <svg className={css.chart} viewBox={`0 0 ${TREND_WIDTH} ${TREND_HEIGHT}`} role="img" aria-label={title}>
-        {rows.map((row, index) => {
-          const barHeight = Math.max(1, Math.round(row.totalTokens / max * TREND_HEIGHT))
-          return (
-            <g key={row.id}>
-              <title>{`${row.title} · ${formatTokens(row.totalTokens)}`}</title>
-              <rect
-                x={index * (barWidth + TREND_BAR_GAP)}
-                y={TREND_HEIGHT - barHeight}
-                width={barWidth}
-                height={barHeight}
-                className={css.bar}
-              />
-            </g>
-          )
-        })}
-      </svg>
+      <div className={css.scaleRow} role="group" aria-label={t('trend.scale')}>
+        {SCALE_OPTIONS.map(option => (
+          <button
+            key={option.key}
+            type="button"
+            className={css.scaleButton}
+            aria-pressed={scale === option.key}
+            onClick={() => { setScale(option.key) }}
+          >
+            {t(option.label)}
+          </button>
+        ))}
+      </div>
+      {visible.length === 0 || max === 0
+        ? <p className={css.trendEmpty}>{t('trend.windowEmpty')}</p>
+        : (
+          <svg className={css.chart} viewBox={`0 0 ${TREND_WIDTH} ${TREND_HEIGHT}`} role="img" aria-label={title}>
+            {ticks.map(value => (
+              <g key={value}>
+                <line
+                  className={css.grid}
+                  x1={TREND_PLOT_LEFT}
+                  x2={TREND_PLOT_LEFT + plotWidth}
+                  y1={yOf(value)}
+                  y2={yOf(value)}
+                />
+                <text className={css.axisLabel} x={0} y={yOf(value) + 3}>{formatTokens(value)}</text>
+              </g>
+            ))}
+            {(() => {
+              const domainStart = windowStart === undefined
+                ? Math.min(...visible.map(row => row.updatedAt))
+                : windowStart
+              const domainEnd = windowStart === undefined
+                ? Math.max(...visible.map(row => row.updatedAt))
+                : now
+              const span = Math.max(domainEnd - domainStart, 1)
+              const barWidth = Math.max(2, Math.floor(plotWidth / visible.length * 0.6))
+              return (
+                <>
+                  {visible.map((row) => {
+                    const barHeight = Math.max(1, Math.round(row.totalTokens / max * plotHeight))
+                    const x = TREND_PLOT_LEFT + (row.updatedAt - domainStart) / span * plotWidth - barWidth / 2
+                    return (
+                      <g key={row.id}>
+                        <title>{`${row.title} · ${formatTokens(row.totalTokens)}`}</title>
+                        <rect
+                          x={x}
+                          y={TREND_PLOT_TOP + plotHeight - barHeight}
+                          width={barWidth}
+                          height={barHeight}
+                          className={css.bar}
+                        />
+                      </g>
+                    )
+                  })}
+                  <text className={css.axisLabel} x={TREND_PLOT_LEFT} y={TREND_HEIGHT - 4}>{dateLabel(domainStart)}</text>
+                  <text className={css.axisLabel} x={TREND_PLOT_LEFT + plotWidth} y={TREND_HEIGHT - 4} textAnchor="end">
+                    {dateLabel(domainEnd)}
+                  </text>
+                </>
+              )
+            })()}
+          </svg>
+        )}
     </>
   )
 }
@@ -209,6 +306,7 @@ export function DashboardAction({ wide, useSessions, t }: DashboardActionProps) 
   const byId = useSessions(state => state.byId)
   const rows = useMemo(() => dashboardRows(byId), [byId])
   const totals = useMemo(() => dashboardTotals(rows, byId), [rows, byId])
+  const now = Date.now()
 
   const billedInput = totals.uncachedInputTokens + totals.cacheReadTokens + totals.cacheWriteTokens
   const cacheHit = billedInput === 0
@@ -274,7 +372,7 @@ export function DashboardAction({ wide, useSessions, t }: DashboardActionProps) 
                   </div>
                 ))}
               </div>
-              <TrendChart rows={rows} title={t('trend.title')} />
+              <TrendChart rows={rows} title={t('trend.title')} t={t} now={now} />
               <h3 className={css.tableTitle}>{t('table.title')}</h3>
               <div className={css.tableWrap}>
                 <table className={css.table}>

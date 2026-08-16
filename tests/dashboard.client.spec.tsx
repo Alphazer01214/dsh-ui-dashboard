@@ -95,6 +95,7 @@ describe('dashboardRows / dashboardTotals', () => {
       inputTokens: 1_200 + 8_000 + 460,
       outputTokens: 340,
       totalTokens: 1_200 + 8_000 + 460 + 340,
+      updatedAt: 2,
     })
     expect(rows[0]!.turns).toBeNull()
     expect(rows[0]!.model).toBeNull()
@@ -184,7 +185,7 @@ describe('DashboardAction', () => {
     expect(screen.queryByText('用量趋势')).toBeNull()
   })
 
-  it('keeps a 1px bar floor when the list outgrows the chart width', () => {
+  it('keeps a minimum bar width when the list outgrows the chart width', () => {
     const byId: Record<SessionId, SessionSummary> = {}
     for (let i = 0; i < 201; i++) {
       const id = `s${i}` as SessionId
@@ -197,8 +198,81 @@ describe('DashboardAction', () => {
     const chart = screen.getByRole('img', { name: '用量趋势' })
     const widths = [...chart.querySelectorAll('rect')].map(rect => Number(rect.getAttribute('width')))
     expect(widths).toHaveLength(201)
-    expect(widths.every(width => width === 1)).toBe(true)
+    expect(widths.every(width => width === 2)).toBe(true)
     view.unmount()
+  })
+
+  it('re-scales the trend to the selected window and labels both axes', () => {
+    const now = Date.now()
+    const byId = record({
+      recent: summary('recent' as SessionId, now - 3 * 86_400_000, {
+        tokenUsage: { uncachedInputTokens: 100, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      }),
+      old: summary('old' as SessionId, now - 8 * 86_400_000, {
+        tokenUsage: { uncachedInputTokens: 50, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      }),
+    })
+    render(<DashboardAction {...props(byId)} />)
+    fireEvent.click(screen.getByRole('button', { name: '用量仪表盘' }))
+    const chart = (): SVGElement => screen.getByRole('img', { name: '用量趋势' })
+    const axisTexts = (): (string | null)[] =>
+      [...chart().querySelectorAll('text')].map(node => node.textContent)
+    // 全部 (default): both bars; the y axis ticks 0 / 50 / 100.
+    expect(chart().querySelectorAll('rect')).toHaveLength(2)
+    expect(axisTexts()).toContain('0')
+    expect(axisTexts()).toContain('50')
+    expect(axisTexts()).toContain('100')
+    expect(screen.getByRole('button', { name: '全部' }).getAttribute('aria-pressed')).toBe('true')
+    // 近 7 天 keeps only the recent session.
+    fireEvent.click(screen.getByRole('button', { name: '近 7 天' }))
+    expect(chart().querySelectorAll('rect')).toHaveLength(1)
+    expect([...chart().querySelectorAll('title')].map(node => node.textContent)).toEqual(['recent · 100'])
+    expect(screen.getByRole('button', { name: '近 7 天' }).getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByRole('button', { name: '全部' }).getAttribute('aria-pressed')).toBe('false')
+    // 近 30 天 keeps both.
+    fireEvent.click(screen.getByRole('button', { name: '近 30 天' }))
+    expect(chart().querySelectorAll('rect')).toHaveLength(2)
+  })
+
+  it('notes an empty window instead of rendering an empty chart', () => {
+    const byId = record({
+      old: summary('old' as SessionId, Date.now() - 8 * 86_400_000, {
+        tokenUsage: { uncachedInputTokens: 50, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      }),
+      olderStats: summary('olderStats' as SessionId, Date.now() - 9 * 86_400_000, { sessionStats: STATS_A }),
+    })
+    render(<DashboardAction {...props(byId)} />)
+    fireEvent.click(screen.getByRole('button', { name: '用量仪表盘' }))
+    // 全部: both rows render; the zero-token bar keeps the 1px height floor.
+    expect(screen.getByRole('img', { name: '用量趋势' }).querySelectorAll('rect')).toHaveLength(2)
+    fireEvent.click(screen.getByRole('button', { name: '近 7 天' }))
+    expect(screen.getByText('该时间尺度下没有可统计的会话')).toBeTruthy()
+    expect(screen.queryByRole('img', { name: '用量趋势' })).toBeNull()
+  })
+
+  it('notes the window when only zero-token sessions fall inside it', () => {
+    const byId = record({
+      old: summary('old' as SessionId, Date.now() - 8 * 86_400_000, {
+        tokenUsage: { uncachedInputTokens: 50, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      }),
+      freshStats: summary('freshStats' as SessionId, Date.now() - 86_400_000, { sessionStats: STATS_A }),
+    })
+    render(<DashboardAction {...props(byId)} />)
+    fireEvent.click(screen.getByRole('button', { name: '用量仪表盘' }))
+    fireEvent.click(screen.getByRole('button', { name: '近 7 天' }))
+    expect(screen.getByText('该时间尺度下没有可统计的会话')).toBeTruthy()
+    expect(screen.queryByRole('img', { name: '用量趋势' })).toBeNull()
+  })
+
+  it('renders the chart for a single session without a time span', () => {
+    const byId = record({
+      solo: summary('solo' as SessionId, 7, {
+        tokenUsage: { uncachedInputTokens: 10, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      }),
+    })
+    render(<DashboardAction {...props(byId)} />)
+    fireEvent.click(screen.getByRole('button', { name: '用量仪表盘' }))
+    expect(screen.getByRole('img', { name: '用量趋势' }).querySelectorAll('rect')).toHaveLength(1)
   })
 
   it('renders the rail trigger without the visible label', () => {

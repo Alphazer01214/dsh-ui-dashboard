@@ -97,6 +97,40 @@
   color: var(--dsw-alias-label-primary);
 }
 
+.scaleRow {
+  display: flex;
+  gap: 6px;
+  margin: 0 0 4px;
+}
+
+.scaleButton {
+  padding: 2px 10px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 20px;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.scaleButton:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.scaleButton[aria-pressed='true'] {
+  background: var(--dsw-alias-interactive-bg-active);
+  color: var(--dsw-alias-label-primary);
+}
+
+.trendEmpty {
+  margin: 8px 0 0;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--dsw-alias-label-secondary);
+}
+
 .chart {
   display: block;
   width: 100%;
@@ -106,6 +140,15 @@
 .chart .bar {
   fill: var(--dsw-alias-brand-primary);
   fill-opacity: 0.85;
+}
+
+.chart line.grid {
+  stroke: var(--dsw-alias-separator-primary);
+}
+
+.chart text.axisLabel {
+  fill: var(--dsw-alias-label-tertiary);
+  font-size: 10px;
 }
 
 .tableWrap {
