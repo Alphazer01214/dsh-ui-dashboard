@@ -1,0 +1,191 @@
+// @vitest-environment jsdom
+import { afterEach, describe, expect, it } from 'vitest'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { makeTranslate } from '@deepseek-ai/dsh-client-test-runtime'
+import type { SessionId, SessionListState, SessionSummary } from '@deepseek-ai/dsh-client-runtime/client'
+// The component's d.ts drops empty type-only imports, so the test program
+// loads the sessionStats projection-key merge itself.
+import type {} from '@deepseek-ai/dsh-session-stats/client'
+import { DashboardAction, dashboardRows, dashboardTotals, type DashboardActionProps } from '../src/client/DashboardAction.tsx'
+import { zh } from '../src/client/locales.ts'
+
+afterEach(() => {
+  cleanup()
+})
+
+const t: DashboardActionProps['t'] = makeTranslate(zh)
+
+function summary(
+  id: SessionId,
+  updatedAt: number,
+  projectionValues: SessionSummary['projectionValues'] | undefined,
+): SessionSummary {
+  return {
+    id,
+    displayTitle: String(id),
+    running: false,
+    blank: false,
+    updatedAt,
+    ...(projectionValues === undefined ? {} : { projectionValues }),
+  }
+}
+
+/** Object literals key on plain strings; the return type brands the keys. */
+function record(map: Record<string, SessionSummary>): Record<SessionId, SessionSummary> {
+  return map
+}
+
+function props(byId: Record<SessionId, SessionSummary>, wide = true) {
+  const state = {
+    ids: Object.keys(byId) as SessionId[],
+    byId,
+    current: undefined,
+    phase: 'ready',
+    subagentsByParent: {},
+    jobsBySession: {},
+    currentAddress: undefined,
+  } satisfies SessionListState
+  function useSessions<T>(select: (snapshot: SessionListState) => T): T {
+    return select(state)
+  }
+  return { wide, useSessions, t } as unknown as DashboardActionProps
+}
+
+const USAGE_A = {
+  uncachedInputTokens: 1_200,
+  outputTokens: 340,
+  cacheReadTokens: 8_000,
+  cacheWriteTokens: 460,
+  model: 'deepseek-chat',
+}
+const USAGE_B = {
+  uncachedInputTokens: 800,
+  outputTokens: 210,
+  cacheReadTokens: 2_000,
+  cacheWriteTokens: 0,
+}
+const STATS_A = {
+  turns: 3, steps: 9, llmMs: 61_000, toolMs: 0, ttftMs: 0, ttftSteps: 0,
+  decodeMs: 20_000, decodeTokens: 300,
+}
+// Megabyte-scale input exercises the >=100 scaled rounding and the M suffix.
+const USAGE_M = {
+  uncachedInputTokens: 150_000_000,
+  outputTokens: 0,
+  cacheReadTokens: 0,
+  cacheWriteTokens: 0,
+}
+// Wall times across the seconds and hours format branches.
+const STATS_CLOCK = {
+  turns: 1, steps: 1, llmMs: 3_661_000, toolMs: 45_000, ttftMs: 0, ttftSteps: 0,
+  decodeMs: 0, decodeTokens: 0,
+}
+
+describe('dashboardRows / dashboardTotals', () => {
+  it('keeps only projected sessions, newest first, with billed-input totals', () => {
+    const byId = record({
+      a: summary('a' as SessionId, 2, { tokenUsage: USAGE_A, sessionStats: STATS_A }),
+      b: summary('b' as SessionId, 3, { tokenUsage: USAGE_B }),
+      fresh: summary('fresh' as SessionId, 9, undefined),
+    })
+    const rows = dashboardRows(byId)
+    expect(rows.map(row => row.id)).toEqual(['b', 'a'])
+    expect(rows[1]).toEqual({
+      id: 'a', title: 'a', model: 'deepseek-chat', turns: 3, steps: 9,
+      inputTokens: 1_200 + 8_000 + 460,
+      outputTokens: 340,
+      totalTokens: 1_200 + 8_000 + 460 + 340,
+    })
+    expect(rows[0]!.turns).toBeNull()
+    expect(rows[0]!.model).toBeNull()
+
+    const totals = dashboardTotals(rows, byId)
+    expect(totals).toEqual({
+      sessions: 2,
+      uncachedInputTokens: 2_000,
+      cacheReadTokens: 10_000,
+      cacheWriteTokens: 460,
+      outputTokens: 550,
+      totalTokens: 2_000 + 10_000 + 460 + 550,
+      turns: 3,
+      steps: 9,
+      llmMs: 61_000,
+      toolMs: 0,
+      decodeMs: 20_000,
+      decodeTokens: 300,
+    })
+  })
+
+  it('counts a session serving only sessionStats', () => {
+    const byId = record({
+      statsOnly: summary('statsOnly' as SessionId, 1, { sessionStats: STATS_A }),
+    })
+    const rows = dashboardRows(byId)
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.totalTokens).toBe(0)
+    expect(dashboardTotals(rows, byId).turns).toBe(3)
+  })
+})
+
+describe('DashboardAction', () => {
+  it('opens the dialog with cross-session cards and the per-session table', () => {
+    const byId = record({
+      a: summary('a' as SessionId, 2, { tokenUsage: USAGE_A, sessionStats: STATS_A }),
+      b: summary('b' as SessionId, 3, { tokenUsage: USAGE_B }),
+    })
+    render(<DashboardAction {...props(byId)} />)
+    fireEvent.click(screen.getByRole('button', { name: '用量仪表盘' }))
+
+    const dialog = screen.getByRole('dialog')
+    expect(dialog.textContent).toContain('2 个会话')
+    // 总 token: four disjoint buckets across both sessions (13_010 -> 13K).
+    expect(screen.getByText('总 token').parentElement!.textContent).toContain('13K')
+    expect(screen.getByText('输入 token').parentElement!.textContent).toContain('12.5K')
+    expect(screen.getByText('输出 token').parentElement!.textContent).toContain('550')
+    // Billed-input cache hit: 10_000 / 12_460 -> 80%.
+    expect(screen.getByText('缓存命中').parentElement!.textContent).toContain('80%')
+    expect(screen.getByText('LLM 时间').parentElement!.textContent).toContain('1 分 1 秒')
+    expect(screen.getByText('平均吞吐').parentElement!.textContent).toContain('15 tok/s')
+    // Per-session rows newest-first; b has no sessionStats so turns stay blank,
+    // and no tokenUsage model so the model cell is blank too.
+    expect(screen.getByText('b')).toBeTruthy()
+    expect(screen.getByText('a')).toBeTruthy()
+    expect(screen.getByText('deepseek-chat')).toBeTruthy()
+    expect(screen.getAllByText('—')).toHaveLength(2)
+    // The zero toolMs card drops out whole.
+    expect(screen.queryByText('工具时间')).toBeNull()
+    // Escape closes the shared Modal.
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(screen.queryByRole('dialog')).toBeNull()
+  })
+
+  it('renders the empty state until a session serves a usage projection', () => {
+    render(<DashboardAction {...props({})} />)
+    fireEvent.click(screen.getByRole('button', { name: '用量仪表盘' }))
+    expect(screen.getByRole('dialog').textContent).toContain('还没有可统计的用量')
+    expect(screen.queryByText('按会话')).toBeNull()
+  })
+
+  it('renders the rail trigger without the visible label', () => {
+    const byId = record({
+      a: summary('a' as SessionId, 2, { tokenUsage: USAGE_A }),
+    })
+    const view = render(<DashboardAction {...props(byId, false)} />)
+    const trigger = screen.getByRole('button', { name: '用量仪表盘' })
+    expect(trigger.textContent).toBe('')
+    view.unmount()
+  })
+
+  it('formats megabyte-scale tokens and the seconds/hours duration branches', () => {
+    const byId = record({
+      big: summary('big' as SessionId, 4, { tokenUsage: USAGE_M, sessionStats: STATS_CLOCK }),
+    })
+    render(<DashboardAction {...props(byId)} />)
+    fireEvent.click(screen.getByRole('button', { name: '用量仪表盘' }))
+    // 150_000_000 -> scaled 150 (>= 100) -> "150M".
+    expect(screen.getByText('总 token').parentElement!.textContent).toContain('150M')
+    // 3_661_000 ms -> 1h 1m; 45_000 ms -> 45s.
+    expect(screen.getByText('LLM 时间').parentElement!.textContent).toContain('1 时 1 分')
+    expect(screen.getByText('工具时间').parentElement!.textContent).toContain('45 秒')
+  })
+})

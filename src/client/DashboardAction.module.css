@@ -1,0 +1,154 @@
+/* Usage dashboard: sidebar-foot trigger row (34px wide row / 36px rail circle,
+   matching the settings trigger rhythm) plus a widened modal with a stat-card
+   grid and a per-session table. */
+
+.trigger {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: calc(100% + 8px);
+  height: 34px;
+  margin: 4px -4px 4px;
+  padding: 6px 2px 6px 10px;
+  box-sizing: border-box;
+  border: none;
+  border-radius: 12px;
+  background: transparent;
+  cursor: pointer;
+  overflow: hidden;
+  color: var(--dsw-alias-label-primary);
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 22px;
+}
+
+.trigger:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+/* Rail trigger: the same 36x36 circle box as the other rail controls. */
+.trigger.rail {
+  width: 36px;
+  height: 36px;
+  margin: 8px 0 10px;
+  justify-content: center;
+  gap: 0;
+  padding: 0;
+  border-radius: 50%;
+}
+
+.triggerLabel {
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+/* The primitive dialog defaults to 380px; the table needs the wider card. */
+.dialog {
+  width: min(640px, 100%);
+}
+
+.sessionCount {
+  margin: 0 0 12px;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+  gap: 8px;
+}
+
+.card {
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--dsw-alias-bg-layer-1);
+}
+
+.cardLabel {
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.cardValue {
+  margin-top: 2px;
+  font-size: 18px;
+  line-height: 26px;
+  font-weight: 500;
+  color: var(--dsw-alias-label-primary);
+}
+
+.tableTitle {
+  margin: 20px 0 8px;
+  font-size: 14px;
+  line-height: 22px;
+  font-weight: 500;
+  color: var(--dsw-alias-label-primary);
+}
+
+.tableWrap {
+  max-height: 40vh;
+  overflow: auto;
+  /* Elevated surface: the modal paints bg-layer-2, so a revealed scrollbar
+     takes the l2 elevation tokens (see ui-theme styles/scrollbar.css for the
+     rebinding contract). */
+  --dsh-scrollbar-thumb: var(--dsw-alias-scrollbar-bg-l2);
+  --dsh-scrollbar-thumb-hover: var(--dsw-alias-scrollbar-hover-l2);
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.table th,
+.table td {
+  padding: 6px 10px 6px 0;
+  text-align: right;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--dsw-alias-separator-primary);
+}
+
+/* The name column is the only left-aligned, truncating cell. */
+.table th:first-child,
+.table td:first-child {
+  text-align: left;
+  max-width: 220px;
+}
+
+.table th {
+  position: sticky;
+  top: 0;
+  font-weight: 400;
+  color: var(--dsw-alias-label-tertiary);
+  background: var(--dsw-alias-bg-layer-2);
+}
+
+.table td {
+  color: var(--dsw-alias-label-primary);
+}
+
+.sessionName {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The model column is text, left-aligned beside the session name. */
+.table .model {
+  text-align: left;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.empty {
+  margin: 8px 0 0;
+  font-size: 14px;
+  line-height: 22px;
+  color: var(--dsw-alias-label-secondary);
+}
