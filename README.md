@@ -2,6 +2,8 @@
 
 English | [中文](README.zh.md)
 
+![dashboard](./assets/dashboard.png)
+
 A usage dashboard for DeepSeek Harness web deployments, shipped as a **dynamic
 Cordis plugin** (one host half, one browser half). It replaces the sidebar's
 built-in usage dialog with a durable, deployment-wide usage ledger that fixes
