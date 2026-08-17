@@ -430,7 +430,10 @@ return {
       const job = async () => {
         const current = table.get(key)
         const record = recordOf(cell)
-        if (current !== undefined && current.seq >= record.seq && current.createdAt === record.createdAt) return false
+        // Skip only a SAME-version record at an equal-or-newer watermark. A
+        // version-mismatched stored record is replaced even at an equal seq,
+        // otherwise a poisoned v1 record could survive the v2 repair refold.
+        if (current !== undefined && current.seq >= record.seq && current.createdAt === record.createdAt && current.v === FOLD_VERSION) return false
         await table.put(key, record)
         return true
       }
@@ -643,9 +646,10 @@ return {
       for (const record of mergedRecords().values()) records.push(record)
       return { format: BACKUP_FORMAT, version: 1, exportedAt: Date.now(), records }
     }
-    // Light backfill for sessions the ledger has never seen (created while the
-    // plugin was stopped, or missed before the global listeners): cheap on
-    // repeat because only record-less sessions are read.
+    // Backfill/repair sweep before every report: fold record-less sessions and
+    // REFOLD stored records whose fold version differs (e.g. poisoned v1
+    // records) from their own seed boundary, so the report never shows data
+    // the current fold would not have produced.
     async function backfillUnknown() {
       const persistence = ctx.get('sessionPersistence')
       if (persistence === undefined) return
@@ -658,7 +662,12 @@ return {
       }
       for (const meta of metas) {
         const key = recordKey(meta.id, meta.createdAt)
-        if (table.get(key) !== undefined || liveCells.has(key)) continue
+        const existing = table.get(key)
+        if (liveCells.has(key)) continue
+        if (existing !== undefined && existing.v === FOLD_VERSION) continue
+        if (existing !== undefined && existing.v !== FOLD_VERSION) {
+          console.error('[usage-dashboard] refolding stale-version record for "' + meta.id + '"')
+        }
         let events
         try {
           const read = await persistence.readFrom(meta.id, meta.seedLength || 0)
@@ -690,6 +699,9 @@ return {
         } catch (error) {
           valid = false
         }
+        // A backup from another fold version cannot be trusted; it is skipped
+        // whole rather than merged over current-version records.
+        if (valid && record.v !== FOLD_VERSION) valid = false
         if (!valid) {
           skipped += 1
           continue
