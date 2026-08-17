@@ -9,7 +9,12 @@
 // other conversation's usage would be missed. The global flag makes the
 // ledger fold every session's events regardless of scope.
 
-const FOLD_VERSION = 1
+// FOLD_VERSION 2: the fold math is unchanged; the bump is a REPAIR marker.
+// v1 could double-count a fork child by folding its inherited seed prefix
+// (a live child's first own event dropped the strict seq check, then the
+// catch-up refolded from seq 0). v2 makes every activation heal refold all
+// records from each session's seed boundary and clears the poisoned ones.
+const FOLD_VERSION = 2
 const WRITE_EVERY_EVENTS = 200
 const WRITE_INTERVAL_MS = 5000
 const BACKUP_FORMAT = 'dsh-usage-dashboard-backup'
@@ -350,9 +355,14 @@ return {
       }
     }
     function foldUpTo(cell, session, uptoSeq) {
-      if (uptoSeq <= cell.seq) return
+      // The seed floor is load-bearing: a fork child's log starts with its
+      // inherited ancestor prefix, which the ancestor's own record already
+      // counts. Folding from cell.seq+1 alone could refold the seed when the
+      // cell was created mid-suffix (first own event), double-counting it.
+      const from = Math.max(cell.seq + 1, session.header.seedLength || 0)
+      if (uptoSeq < from) return
       const events = session.events
-      for (let index = cell.seq + 1; index < events.length; index += 1) {
+      for (let index = from; index < events.length; index += 1) {
         const event = events[index]
         if (!event || event.seq > uptoSeq) break
         foldOne(cell, event)
@@ -446,7 +456,10 @@ return {
     // other conversation's usage.
     ctx.on('session/event', (session, event) => {
       const cell = cellForLive(session, event.seq - 1)
-      if (event.seq !== cell.seq + 1) return
+      // Tolerant advance check: for a fork child the first own event has seq
+      // = seedLength (>= 1), so the strict === cell.seq + 1 check (cell.seq is
+      // still -1) must not drop it.
+      if (event.seq <= cell.seq) return
       foldOne(cell, event)
       cell.pending += 1
       if (event.type === 'turn/end') {

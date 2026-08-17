@@ -161,7 +161,7 @@ function TrendChart(props) {
         fill: 'var(--dsw-alias-label-secondary, #666)',
         fontSize: 9,
         textAnchor: index === 0 ? 'start' : index === xLabels.length - 1 ? 'end' : 'middle',
-      }, timeLabel(point.date))))))
+      }, timeLabel(point.date)))))
 }
 
 function DashboardAction(props) {
