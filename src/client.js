@@ -1,5 +1,16 @@
 // ---- usage-dashboard client: replaces the shipped footer action with the
 // host-ledger-backed dashboard ----
+//
+// This file is the canonical browser-half module. It is NOT loaded directly:
+// `node scripts/build.mjs` wraps it into lib/client.js, a
+// window.__ModuleLoader__.load({ id, factory }) bundle whose factory provides
+// `React` (require('react'), the platform seed word) before this body runs.
+// Keep every render call as React.createElement(...); the wrapper owns the
+// React binding.
+//
+// The browser half is a trusted composition row, so it reaches the host
+// ledger over the same-origin webServer routes below (report / export /
+// import) instead of the dynamic-runner's host.call channel.
 
 const CSS = `
 .ud-trigger { display: flex; align-items: center; gap: 6px; width: 100%; padding: 6px 8px; border: none; background: transparent; color: var(--dsw-alias-label-primary, #1a1a1a); border-radius: 6px; cursor: pointer; font-size: 13px; box-sizing: border-box; }
@@ -35,6 +46,20 @@ const CSS = `
 .ud-ok { color: var(--dsw-alias-state-success-primary, #2e7d32); font-size: 12px; margin: 8px 0; }
 .ud-empty { color: var(--dsw-alias-label-secondary, #666); font-size: 12px; margin: 10px 0; }
 `
+
+// Same-origin JSON fetch against the host's webServer routes; rejects with
+// the host's { error } message on failure.
+function apiFetch(url, options) {
+  return fetch(url, options).then((response) => {
+    if (!response.ok) {
+      return response.json().then(
+        (body) => { throw new Error(body && typeof body.error === 'string' ? body.error : 'HTTP ' + response.status) },
+        () => { throw new Error('HTTP ' + response.status) },
+      )
+    }
+    return response.json()
+  })
+}
 
 function formatTokens(value) {
   if (value < 1000) return String(Math.round(value))
@@ -353,26 +378,36 @@ function DashboardAction(props) {
         body)))
 }
 
-return {
-  name: 'usage-dashboard-client',
-  inject: ['slots'],
-  apply(ctx) {
-    const slots = ctx.get('slots')
-    if (slots === undefined) {
-      console.error('[usage-dashboard] slots service is absent; the sidebar action is disabled')
-      return
-    }
-    ctx.effect(() => styles.insert(CSS), 'usage-dashboard: styles')
-    slots.inject('sidebar.footer.action', () => slots.register({
-      name: 'sidebar.footer.action',
-      id: 'usage-dashboard',
-      order: 0,
-      label: '用量',
-      inject: () => ({
-        load: () => host.call('usage.report'),
-        exportBackup: () => host.call('usage.export'),
-        importBackup: (document) => host.call('usage.import', { document }),
+export const name = 'usage-dashboard-client'
+export const inject = ['slots']
+
+export function apply(ctx) {
+  const slots = ctx.get('slots')
+  if (slots === undefined) {
+    console.error('[usage-dashboard] slots service is absent; the sidebar action is disabled')
+    return
+  }
+  ctx.effect(() => {
+    const tag = document.createElement('style')
+    tag.dataset.plugin = 'dsh-usage-dashboard'
+    tag.dataset.pluginCss = 'dsh-usage-dashboard'
+    tag.textContent = CSS
+    document.head.appendChild(tag)
+    return () => { if (tag.isConnected) tag.remove() }
+  }, 'usage-dashboard: styles')
+  slots.inject('sidebar.footer.action', () => slots.register({
+    name: 'sidebar.footer.action',
+    id: 'usage-dashboard',
+    order: 0,
+    label: '用量',
+    inject: () => ({
+      load: () => apiFetch('/usage-dashboard/report'),
+      exportBackup: () => apiFetch('/usage-dashboard/export'),
+      importBackup: (document) => apiFetch('/usage-dashboard/import', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ document }),
       }),
-    }, DashboardAction))
-  },
+    }),
+  }, DashboardAction))
 }

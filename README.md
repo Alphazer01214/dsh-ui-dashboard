@@ -4,10 +4,11 @@ English | [中文](README.zh.md)
 
 ![dashboard](./assets/dashboard.png)
 
-A usage dashboard for DeepSeek Harness web deployments, shipped as a **dynamic
-Cordis plugin** (one host half, one browser half). It replaces the sidebar's
-built-in usage dialog with a durable, deployment-wide usage ledger that fixes
-the built-in dashboard's four structural problems:
+A usage dashboard for DeepSeek Harness web deployments, shipped as a
+**first-class composition plugin** (one host half, one trusted browser half).
+It replaces the sidebar's built-in usage dialog with a durable,
+deployment-wide usage ledger that fixes the built-in dashboard's four
+structural problems:
 
 1. **No manual expansion.** The built-in dashboard folds only the sessions the
    browser has loaded. This plugin backfills every persisted session straight
@@ -32,48 +33,62 @@ session, attributed to its parent), and draws the usage trend **per day** —
 stacked input/output bars plus a cumulative line, with 7-day / 30-day / all
 windows.
 
+## Why a composition plugin (and no approval dialog)
+
+The earlier releases installed the dashboard as a **dynamic Cordis package**
+per session (via the `autoload/` loader). Dynamic browser halves are gated by
+the harness's client-code activation policy, so every harness start showed a
+Cordis approval dialog for `usage-dashboard` in every session. This release
+mounts the same host ledger and the same sidebar dialog as ordinary
+composition rows in the web profile patch: the browser half is part of the
+trusted page composition, so **no dynamic plugin is defined, nothing is
+approved, and no dialog ever appears**. The ledger data itself is unchanged
+and carries over seamlessly.
+
 ## Requirements
 
-A DeepSeek Harness **web-profile** deployment that mounts `storage-domain` and
-`session-persistence` (the standard web bundle does). The plugin reads only
-public services — it changes no harness code.
+A DeepSeek Harness **web-profile** deployment that mounts `storage-domain`,
+`session-persistence`, and `webServer` (the standard web bundle does). The
+plugin reads only public services — it changes no harness code.
 
-## Loading the plugin
+## Installation (per deployment)
 
-The plugin is a dynamic Cordis package. In the harness GUI (or via the cordis
-API): define a package whose **host half is `src/host.js`** and whose **client
-half is `src/client.js`**, then run it and approve the browser half. The sidebar
-"用量" action now opens the ledger-backed dashboard (it replaces the built-in
-entry in `sidebar.footer.action`; stopping the plugin restores the built-in
-one).
+1. Build the deployable package (or use a release's prebuilt `lib/`):
 
-### Deployment auto-install (no harness code changes)
-
-To install the dashboard into a deployment so it loads automatically for every
-session, use the `autoload/` loader package and the deployment's own profile
-patch layer (under `$DSH_HOME/profiles/<profile>/`):
-
-1. Copy `autoload/` to
-   `<profile>/packages/dsh-usage-dashboard-autoload/` (package.json +
-   lib/index.js).
-2. Add
-   `"dsh-usage-dashboard-autoload": "file:./packages/dsh-usage-dashboard-autoload"`
-   to `<profile>/package.json` dependencies and run `pnpm install` in the
-   profile directory (the profile's hoisted linker puts it into
-   `profiles/node_modules`, where the loader resolves bare row names).
-3. Append to `<profile>/cordis.patch.yml`:
-
-   ```yaml
-   - insert:
-       - id: usage-dashboard-autoload
-         name: dsh-usage-dashboard-autoload
+   ```sh
+   node scripts/build.mjs   # emits lib/index.js (host) + lib/client.js (browser bundle)
    ```
 
-4. Restart the harness. For every **root** session the loader now defines and
-   runs the dashboard automatically (subagent children are skipped; the root
-   instance folds every session globally). The browser half still requires one
-   approval per session per process run — that is the harness's client-code
-   activation policy, and it is the only per-session step left.
+2. Copy the package into the profile's packages directory:
+
+   ```sh
+   cp -r . "$DSH_HOME/profiles/<profile>/packages/dsh-usage-dashboard"
+   ```
+
+3. Add the dependency to `<profile>/package.json` and link it:
+
+   ```json
+   "dependencies": { "dsh-usage-dashboard": "file:./packages/dsh-usage-dashboard" }
+   ```
+
+   then run `pnpm install` in the profile directory.
+
+4. Append to `<profile>/cordis.patch.yml`:
+
+   ```yaml
+   # Usage dashboard: durable cross-session ledger (host) + trusted sidebar
+   # dashboard (browser). No dynamic-plugin approval is involved.
+   - insert:
+       - id: usage-dashboard
+         name: dsh-usage-dashboard
+   # Keep only the most feature-complete dashboard: disable the shipped
+   # projection-only footer action (same sidebar cell).
+   - id: ui-dashboard
+     disabled: true
+   ```
+
+5. Restart the harness. The sidebar now shows a single 用量 action backed by
+   the durable ledger, for every session, with no approval prompts.
 
 ## What the dialog shows
 
@@ -100,22 +115,23 @@ patch layer (under `$DSH_HOME/profiles/<profile>/`):
   subagent children count exactly what they themselves billed, and the
   inherited prefix stays attributed to the ancestor — the totals are the true
   billed usage with no double counting anywhere in a fork tree.
-- Live sessions fold through `session/event` with `{ global: true }` listeners
-  (a dynamic package mounts in the requesting session's agent scope; without
-  the flag other conversations' events would never reach it). Activation heals
-  every stored tail, materializes live cells, and `usage.report` additionally
-  backfills any session the ledger has never seen, so the report is complete
-  even for sessions created while the plugin was stopped.
+- Live sessions fold through `session/event` listeners registered with
+  `{ global: true }` (at the host root this is the default view anyway; the
+  flag keeps the code scope-independent). Activation heals every stored tail,
+  materializes live cells, and the report additionally backfills any session
+  the ledger has never seen, so the report is complete even for sessions
+  created while the plugin was stopped.
 - The backup document is `{ format: 'dsh-usage-dashboard-backup', version: 1,
   exportedAt, records }`. Import validates every record and merges by key: a
   record is adopted only when its seq is higher than the stored one, so
   repeated imports are idempotent.
+- The browser half fetches `/usage-dashboard/report`, `/usage-dashboard/export`,
+  and `/usage-dashboard/import` (same-origin webServer routes registered by the
+  host half) — the dynamic runner's `harness.handle`/`host.call` channel does
+  not exist for composition rows.
 
 ## Known limitations
 
-- **Process-local.** Dynamic plugins do not survive a harness restart: re-run
-  the package after restarting. The ledger itself is durable, so the numbers
-  continue seamlessly on the next activation.
 - **Backup travels as text.** Export renders the JSON document in a textarea
   (copy it to a file); import accepts the same JSON pasted back.
 - **Day buckets use the host's local calendar.** Totals never depend on the
@@ -128,7 +144,12 @@ patch layer (under `$DSH_HOME/profiles/<profile>/`):
 
 ## Repository layout
 
-- `src/host.js` — the exact `code.host` function body (ledger, heal/backfill,
-  report/export/import RPC).
-- `src/client.js` — the exact `code.client` function body (sidebar action and
-  dialog).
+- `src/host.js` — the canonical host-half module (ledger, heal/backfill,
+  report/export/import webServer routes).
+- `src/client.js` — the canonical browser-half module (sidebar action and
+  dialog; `React` is provided by the bundle wrapper).
+- `scripts/build.mjs` — generates `lib/index.js` and `lib/client.js` from the
+  sources (the browser bundle is a `window.__ModuleLoader__.load({ id,
+  factory })` handoff).
+- `package.json` — the deployable package manifest (`dsh.client` declares the
+  web browser half; `exports["./client"]` points at the bundle).

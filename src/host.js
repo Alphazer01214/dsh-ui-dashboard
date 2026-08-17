@@ -1,13 +1,17 @@
 // ---- usage-dashboard host: durable cross-session usage ledger ----
+// A first-class composition plugin (a loader row in a dsh web profile patch),
+// not a dynamic package: the host half runs once at the host root and the
+// browser half is part of the trusted page composition, so there is no
+// per-session dynamic-plugin approval dialog.
 // Reads only public harness services (storageDomain, sessionPersistence,
-// sessions, sessionProjections for cross-checks) and the committed-event
-// feed. No harness code changes.
+// sessions, sessionProjections for cross-checks), the committed-event feed,
+// and the webServer route table (the browser half fetches the report over
+// same-origin HTTP). No harness code changes.
 //
-// IMPORTANT: the session/event listeners register with { global: true }.
-// A dynamic package mounts inside the requesting session's agent scope, so a
-// plain listener would only see THAT session's committed events and every
-// other conversation's usage would be missed. The global flag makes the
-// ledger fold every session's events regardless of scope.
+// The session/event listeners keep { global: true }. At the host root a plain
+// listener already receives every session's events; the flag makes the same
+// code scope-independent (it was load-bearing when this half ran inside an
+// agent scope as a dynamic package).
 
 // FOLD_VERSION 2: the fold math is unchanged; the bump is a REPAIR marker.
 // v1 could double-count a fork child by folding its inherited seed prefix
@@ -292,445 +296,484 @@ function validateRecord(value) {
   return value
 }
 
-return {
-  name: 'usage-dashboard',
-  inject: ['timer'],
-  async apply(ctx) {
-    const storageDomain = ctx.get('storageDomain')
-    if (storageDomain === undefined) {
-      console.error('[usage-dashboard] storageDomain service is absent; the ledger is disabled')
+export const name = 'usage-dashboard'
+export const inject = ['timer', 'webServer']
+
+export async function apply(ctx) {
+  const storageDomain = ctx.get('storageDomain')
+  if (storageDomain === undefined) {
+    console.error('[usage-dashboard] storageDomain service is absent; the ledger is disabled')
+    return
+  }
+  const domain = await storageDomain.open({
+    name: 'usage_dashboard',
+    version: 1,
+    tables: { sessions: { valueSchema: { parse: validateRecord } } },
+  })
+  ctx.effect(() => () => domain.close(), 'usage-dashboard: domain lifecycle')
+  const table = domain.table('sessions')
+  const timer = ctx.timer
+  const webServer = ctx.webServer
+
+  const liveCells = new Map()
+  const writeChains = new Map()
+  const recordKey = (id, createdAt) => String(id) + '@' + String(createdAt)
+
+  function makeCell(id, createdAt, cwd, parentSessionId, origin) {
+    return {
+      id: String(id),
+      createdAt,
+      cwd,
+      parentSessionId,
+      origin,
+      seq: -1,
+      firstSeen: 0,
+      lastSeen: 0,
+      state: initState(),
+      dirty: false,
+      pending: 0,
+      timer: null,
+    }
+  }
+  function adoptRecord(cell, record) {
+    cell.seq = record.seq
+    cell.firstSeen = record.firstSeen
+    cell.lastSeen = record.lastSeen
+    cell.state = record.state
+    cell.dirty = false
+  }
+  function foldOne(cell, event) {
+    const first = cell.seq < 0
+    const next = applyEvent(cell.state, event)
+    const changed = next !== cell.state
+    cell.state = next
+    cell.seq = event.seq
+    cell.lastSeen = event.time
+    if (first) cell.firstSeen = event.time
+    if (changed) cell.dirty = true
+  }
+  function foldEvents(cell, events, uptoSeq) {
+    for (const event of events) {
+      if (!event || event.seq > uptoSeq) break
+      if (event.seq <= cell.seq) continue
+      foldOne(cell, event)
+    }
+  }
+  function foldUpTo(cell, session, uptoSeq) {
+    // The seed floor is load-bearing: a fork child's log starts with its
+    // inherited ancestor prefix, which the ancestor's own record already
+    // counts. Folding from cell.seq+1 alone could refold the seed when the
+    // cell was created mid-suffix (first own event), double-counting it.
+    const from = Math.max(cell.seq + 1, session.header.seedLength || 0)
+    if (uptoSeq < from) return
+    const events = session.events
+    for (let index = from; index < events.length; index += 1) {
+      const event = events[index]
+      if (!event || event.seq > uptoSeq) break
+      foldOne(cell, event)
+    }
+  }
+  function cellForLive(session, uptoSeq) {
+    const key = recordKey(session.id, session.header.createdAt)
+    const existing = liveCells.get(key)
+    if (existing !== undefined) {
+      foldUpTo(existing, session, uptoSeq)
+      return existing
+    }
+    const record = table.get(key)
+    const usable = record !== undefined
+      && record.v === FOLD_VERSION
+      && record.createdAt === session.header.createdAt
+      && record.cwd === session.header.cwd
+    const cell = makeCell(session.id, session.header.createdAt, session.header.cwd, session.header.parentSession, session.header.origin)
+    if (usable) {
+      adoptRecord(cell, record)
+      foldEvents(cell, session.events.slice(cell.seq + 1), uptoSeq)
+    } else {
+      if (record !== undefined) console.error('[usage-dashboard] session ' + session.id + ' has a mismatched stored record; folding fresh')
+      foldEvents(cell, session.events.slice(session.header.seedLength || 0), uptoSeq)
+      cell.dirty = cell.seq >= 0
+    }
+    liveCells.set(key, cell)
+    return cell
+  }
+
+  function crossCheck(cell, session) {
+    const projections = ctx.get('sessionProjections')
+    if (projections === undefined) return
+    try {
+      const snapshot = projections.snapshot(session)
+      const usage = snapshot && snapshot.values ? snapshot.values.tokenUsage : undefined
+      if (usage === undefined) return
+      const mine = sumDays(cell.state.days)
+      if (mine.uncachedInputTokens !== usage.uncachedInputTokens
+        || mine.outputTokens !== usage.outputTokens
+        || mine.cacheReadTokens !== usage.cacheReadTokens
+        || mine.cacheWriteTokens !== usage.cacheWriteTokens) {
+        console.error('[usage-dashboard] bucket mismatch for session ' + session.id + ': ledger=' + JSON.stringify(mine) + ' tokenUsage=' + JSON.stringify(usage))
+      }
+    } catch (error) {
+      // the cross-check must never break the write path
+    }
+  }
+
+  function recordOf(cell) {
+    return {
+      id: cell.id,
+      createdAt: cell.createdAt,
+      ...(cell.cwd !== undefined ? { cwd: cell.cwd } : {}),
+      ...(cell.parentSessionId !== undefined ? { parentSessionId: cell.parentSessionId } : {}),
+      ...(cell.origin !== undefined ? { origin: cell.origin } : {}),
+      seq: cell.seq,
+      firstSeen: cell.firstSeen,
+      lastSeen: cell.lastSeen,
+      v: FOLD_VERSION,
+      state: cell.state,
+    }
+  }
+  function writeCell(key, cell) {
+    const job = async () => {
+      const current = table.get(key)
+      const record = recordOf(cell)
+      if (current !== undefined && current.seq >= record.seq && current.createdAt === record.createdAt) return false
+      await table.put(key, record)
+      return true
+    }
+    const previous = writeChains.get(key) || Promise.resolve()
+    const next = previous.then(job)
+    writeChains.set(key, next.then(() => {}, () => {}))
+    return next
+  }
+  async function flushSoft(cell, session, trigger) {
+    try {
+      if (cell.timer !== null) { cell.timer(); cell.timer = null }
+      cell.pending = 0
+      crossCheck(cell, session)
+      await writeCell(recordKey(cell.id, cell.createdAt), cell)
+      cell.dirty = false
+    } catch (error) {
+      console.error('[usage-dashboard] ' + trigger + ' write for "' + cell.id + '" failed: ' + String(error))
+    }
+  }
+
+  // Global listeners: see the header comment. Without the flag the ledger
+  // would only fold the requesting session's events and under-count every
+  // other conversation's usage.
+  ctx.on('session/event', (session, event) => {
+    const cell = cellForLive(session, event.seq - 1)
+    // Tolerant advance check: for a fork child the first own event has seq
+    // = seedLength (>= 1), so the strict === cell.seq + 1 check (cell.seq is
+    // still -1) must not drop it.
+    if (event.seq <= cell.seq) return
+    foldOne(cell, event)
+    cell.pending += 1
+    if (event.type === 'turn/end') {
+      void flushSoft(cell, session, 'turn/end')
       return
     }
-    const domain = await storageDomain.open({
-      name: 'usage_dashboard',
-      version: 1,
-      tables: { sessions: { valueSchema: { parse: validateRecord } } },
-    })
-    ctx.effect(() => () => domain.close(), 'usage-dashboard: domain lifecycle')
-    const table = domain.table('sessions')
-    const timer = ctx.timer
+    if (cell.pending >= WRITE_EVERY_EVENTS) {
+      void flushSoft(cell, session, 'count threshold')
+      return
+    }
+    if (cell.timer === null) {
+      cell.timer = timer.timeout(() => { void flushSoft(cell, session, 'interval') }, WRITE_INTERVAL_MS)
+    }
+  }, { global: true })
+  ctx.on('session/disposed', (session) => {
+    const key = recordKey(session.id, session.header.createdAt)
+    const cell = liveCells.get(key)
+    if (cell === undefined) return
+    foldUpTo(cell, session, session.events.length - 1)
+    void flushSoft(cell, session, 'dispose')
+    if (cell.timer !== null) { cell.timer(); cell.timer = null }
+    cell.pending = 0
+    liveCells.delete(key)
+  }, { global: true })
+  ctx.effect(() => () => {
+    for (const cell of liveCells.values()) {
+      if (cell.timer !== null) cell.timer()
+    }
+    liveCells.clear()
+  }, 'usage-dashboard: timers')
 
-    const liveCells = new Map()
-    const writeChains = new Map()
-    const recordKey = (id, createdAt) => String(id) + '@' + String(createdAt)
-
-    function makeCell(id, createdAt, cwd, parentSessionId, origin) {
-      return {
-        id: String(id),
-        createdAt,
-        cwd,
-        parentSessionId,
-        origin,
-        seq: -1,
-        firstSeen: 0,
-        lastSeen: 0,
-        state: initState(),
-        dirty: false,
-        pending: 0,
-        timer: null,
+  // ---- heal: fold every committed tail and every never-seen session
+  // straight from the stored logs, and MATERIALIZE live cells into the
+  // table so idle attached sessions appear without waiting for a flush ----
+  async function heal() {
+    const persistence = ctx.get('sessionPersistence')
+    const sessionsService = ctx.get('sessions')
+    const liveIds = new Set()
+    if (sessionsService !== undefined) {
+      try {
+        for (const session of sessionsService.list()) {
+          liveIds.add(session.id)
+          const cell = cellForLive(session, session.events.length - 1)
+          try {
+            await writeCell(recordKey(cell.id, cell.createdAt), cell)
+          } catch (error) {
+            console.error('[usage-dashboard] heal write for live "' + cell.id + '" failed: ' + String(error))
+          }
+        }
+      } catch (error) {
+        console.error('[usage-dashboard] live-session heal failed: ' + String(error))
       }
     }
-    function adoptRecord(cell, record) {
-      cell.seq = record.seq
-      cell.firstSeen = record.firstSeen
-      cell.lastSeen = record.lastSeen
-      cell.state = record.state
-      cell.dirty = false
+    if (persistence === undefined) return
+    let metas
+    try {
+      metas = await persistence.list()
+    } catch (error) {
+      console.error('[usage-dashboard] persistence.list failed: ' + String(error))
+      return
     }
-    function foldOne(cell, event) {
-      const first = cell.seq < 0
-      const next = applyEvent(cell.state, event)
-      const changed = next !== cell.state
-      cell.state = next
-      cell.seq = event.seq
-      cell.lastSeen = event.time
-      if (first) cell.firstSeen = event.time
-      if (changed) cell.dirty = true
-    }
-    function foldEvents(cell, events, uptoSeq) {
-      for (const event of events) {
-        if (!event || event.seq > uptoSeq) break
-        if (event.seq <= cell.seq) continue
-        foldOne(cell, event)
-      }
-    }
-    function foldUpTo(cell, session, uptoSeq) {
-      // The seed floor is load-bearing: a fork child's log starts with its
-      // inherited ancestor prefix, which the ancestor's own record already
-      // counts. Folding from cell.seq+1 alone could refold the seed when the
-      // cell was created mid-suffix (first own event), double-counting it.
-      const from = Math.max(cell.seq + 1, session.header.seedLength || 0)
-      if (uptoSeq < from) return
-      const events = session.events
-      for (let index = from; index < events.length; index += 1) {
-        const event = events[index]
-        if (!event || event.seq > uptoSeq) break
-        foldOne(cell, event)
-      }
-    }
-    function cellForLive(session, uptoSeq) {
-      const key = recordKey(session.id, session.header.createdAt)
-      const existing = liveCells.get(key)
-      if (existing !== undefined) {
-        foldUpTo(existing, session, uptoSeq)
-        return existing
-      }
+    for (const meta of metas) {
+      if (liveIds.has(meta.id)) continue
+      const key = recordKey(meta.id, meta.createdAt)
       const record = table.get(key)
       const usable = record !== undefined
         && record.v === FOLD_VERSION
-        && record.createdAt === session.header.createdAt
-        && record.cwd === session.header.cwd
-      const cell = makeCell(session.id, session.header.createdAt, session.header.cwd, session.header.parentSession, session.header.origin)
-      if (usable) {
-        adoptRecord(cell, record)
-        foldEvents(cell, session.events.slice(cell.seq + 1), uptoSeq)
-      } else {
-        if (record !== undefined) console.error('[usage-dashboard] session ' + session.id + ' has a mismatched stored record; folding fresh')
-        foldEvents(cell, session.events.slice(session.header.seedLength || 0), uptoSeq)
-        cell.dirty = cell.seq >= 0
-      }
-      liveCells.set(key, cell)
-      return cell
-    }
-
-    function crossCheck(cell, session) {
-      const projections = ctx.get('sessionProjections')
-      if (projections === undefined) return
+        && record.createdAt === meta.createdAt
+        && record.cwd === meta.cwd
+      const from = usable ? record.seq + 1 : (meta.seedLength || 0)
+      let events
       try {
-        const snapshot = projections.snapshot(session)
-        const usage = snapshot && snapshot.values ? snapshot.values.tokenUsage : undefined
-        if (usage === undefined) return
-        const mine = sumDays(cell.state.days)
-        if (mine.uncachedInputTokens !== usage.uncachedInputTokens
-          || mine.outputTokens !== usage.outputTokens
-          || mine.cacheReadTokens !== usage.cacheReadTokens
-          || mine.cacheWriteTokens !== usage.cacheWriteTokens) {
-          console.error('[usage-dashboard] bucket mismatch for session ' + session.id + ': ledger=' + JSON.stringify(mine) + ' tokenUsage=' + JSON.stringify(usage))
-        }
+        const read = await persistence.readFrom(meta.id, from)
+        events = read.events
       } catch (error) {
-        // the cross-check must never break the write path
+        // deleted or unreadable log: the stored record stays authoritative
+        continue
       }
-    }
-
-    function recordOf(cell) {
-      return {
-        id: cell.id,
-        createdAt: cell.createdAt,
-        ...(cell.cwd !== undefined ? { cwd: cell.cwd } : {}),
-        ...(cell.parentSessionId !== undefined ? { parentSessionId: cell.parentSessionId } : {}),
-        ...(cell.origin !== undefined ? { origin: cell.origin } : {}),
-        seq: cell.seq,
-        firstSeen: cell.firstSeen,
-        lastSeen: cell.lastSeen,
-        v: FOLD_VERSION,
-        state: cell.state,
-      }
-    }
-    function writeCell(key, cell) {
-      const job = async () => {
-        const current = table.get(key)
-        const record = recordOf(cell)
-        // Skip only a SAME-version record at an equal-or-newer watermark. A
-        // version-mismatched stored record is replaced even at an equal seq,
-        // otherwise a poisoned v1 record could survive the v2 repair refold.
-        if (current !== undefined && current.seq >= record.seq && current.createdAt === record.createdAt && current.v === FOLD_VERSION) return false
-        await table.put(key, record)
-        return true
-      }
-      const previous = writeChains.get(key) || Promise.resolve()
-      const next = previous.then(job)
-      writeChains.set(key, next.then(() => {}, () => {}))
-      return next
-    }
-    async function flushSoft(cell, session, trigger) {
+      if (!Array.isArray(events) || events.length === 0) continue
+      const cell = makeCell(meta.id, meta.createdAt, meta.cwd, meta.parentSession, meta.origin)
+      if (usable) adoptRecord(cell, record)
+      foldEvents(cell, events, Number.MAX_SAFE_INTEGER)
+      if (cell.seq < 0) continue
       try {
-        if (cell.timer !== null) { cell.timer(); cell.timer = null }
-        cell.pending = 0
-        crossCheck(cell, session)
-        await writeCell(recordKey(cell.id, cell.createdAt), cell)
-        cell.dirty = false
+        await writeCell(key, cell)
       } catch (error) {
-        console.error('[usage-dashboard] ' + trigger + ' write for "' + cell.id + '" failed: ' + String(error))
+        console.error('[usage-dashboard] heal write for "' + meta.id + '" failed: ' + String(error))
       }
     }
+  }
 
-    // Global listeners: see the header comment. Without the flag the ledger
-    // would only fold the requesting session's events and under-count every
-    // other conversation's usage.
-    ctx.on('session/event', (session, event) => {
-      const cell = cellForLive(session, event.seq - 1)
-      // Tolerant advance check: for a fork child the first own event has seq
-      // = seedLength (>= 1), so the strict === cell.seq + 1 check (cell.seq is
-      // still -1) must not drop it.
-      if (event.seq <= cell.seq) return
-      foldOne(cell, event)
-      cell.pending += 1
-      if (event.type === 'turn/end') {
-        void flushSoft(cell, session, 'turn/end')
-        return
-      }
-      if (cell.pending >= WRITE_EVERY_EVENTS) {
-        void flushSoft(cell, session, 'count threshold')
-        return
-      }
-      if (cell.timer === null) {
-        cell.timer = timer.timeout(() => { void flushSoft(cell, session, 'interval') }, WRITE_INTERVAL_MS)
-      }
-    }, { global: true })
-    ctx.on('session/disposed', (session) => {
-      const key = recordKey(session.id, session.header.createdAt)
-      const cell = liveCells.get(key)
-      if (cell === undefined) return
-      foldUpTo(cell, session, session.events.length - 1)
-      void flushSoft(cell, session, 'dispose')
-      if (cell.timer !== null) { cell.timer(); cell.timer = null }
-      cell.pending = 0
-      liveCells.delete(key)
-    }, { global: true })
-    ctx.effect(() => () => {
-      for (const cell of liveCells.values()) {
-        if (cell.timer !== null) cell.timer()
-      }
-      liveCells.clear()
-    }, 'usage-dashboard: timers')
-
-    // ---- heal: fold every committed tail and every never-seen session
-    // straight from the stored logs, and MATERIALIZE live cells into the
-    // table so idle attached sessions appear without waiting for a flush ----
-    async function heal() {
-      const persistence = ctx.get('sessionPersistence')
-      const sessionsService = ctx.get('sessions')
-      const liveIds = new Set()
-      if (sessionsService !== undefined) {
-        try {
-          for (const session of sessionsService.list()) {
-            liveIds.add(session.id)
-            const cell = cellForLive(session, session.events.length - 1)
-            try {
-              await writeCell(recordKey(cell.id, cell.createdAt), cell)
-            } catch (error) {
-              console.error('[usage-dashboard] heal write for live "' + cell.id + '" failed: ' + String(error))
-            }
-          }
-        } catch (error) {
-          console.error('[usage-dashboard] live-session heal failed: ' + String(error))
-        }
-      }
-      if (persistence === undefined) return
-      let metas
+  // ---- report / backup ----
+  // The report overlays the live cells over the durable table, so in-flight
+  // usage is visible immediately; live cells never outrank a newer record.
+  function mergedRecords() {
+    const records = new Map()
+    for (const pair of table.entries()) records.set(pair[0], pair[1])
+    for (const entry of liveCells) {
+      const key = entry[0]
+      const cell = entry[1]
+      const current = records.get(key)
+      if (current === undefined || cell.seq > current.seq) records.set(key, recordOf(cell))
+    }
+    return records
+  }
+  function buildReport() {
+    const totals = { sessions: 0, uncachedInputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 }
+    const dayPoints = new Map()
+    const modelRows = new Map()
+    const sessionRows = []
+    for (const record of mergedRecords().values()) {
       try {
-        metas = await persistence.list()
+        validateRecord(record)
       } catch (error) {
-        console.error('[usage-dashboard] persistence.list failed: ' + String(error))
-        return
+        console.error('[usage-dashboard] skipping invalid record for "' + String(record && record.id) + '": ' + String(error))
+        continue
       }
-      for (const meta of metas) {
-        if (liveIds.has(meta.id)) continue
-        const key = recordKey(meta.id, meta.createdAt)
-        const record = table.get(key)
-        const usable = record !== undefined
-          && record.v === FOLD_VERSION
-          && record.createdAt === meta.createdAt
-          && record.cwd === meta.cwd
-        const from = usable ? record.seq + 1 : (meta.seedLength || 0)
-        let events
-        try {
-          const read = await persistence.readFrom(meta.id, from)
-          events = read.events
-        } catch (error) {
-          // deleted or unreadable log: the stored record stays authoritative
-          continue
-        }
-        if (!Array.isArray(events) || events.length === 0) continue
-        const cell = makeCell(meta.id, meta.createdAt, meta.cwd, meta.parentSession, meta.origin)
-        if (usable) adoptRecord(cell, record)
-        foldEvents(cell, events, Number.MAX_SAFE_INTEGER)
-        if (cell.seq < 0) continue
-        try {
-          await writeCell(key, cell)
-        } catch (error) {
-          console.error('[usage-dashboard] heal write for "' + meta.id + '" failed: ' + String(error))
-        }
+      const state = record.state
+      const buckets = sumDays(state.days)
+      if (isZeroBuckets(buckets) && state.turns === 0 && state.steps === 0) continue
+      totals.sessions += 1
+      addInto(totals, buckets)
+      totals.turns += state.turns
+      totals.steps += state.steps
+      totals.llmMs += state.llmMs
+      totals.toolMs += state.toolMs
+      totals.ttftMs += state.ttftMs
+      totals.ttftSteps += state.ttftSteps
+      totals.decodeMs += state.decodeMs
+      totals.decodeTokens += state.decodeTokens
+      for (const day of Object.keys(state.days)) {
+        const bucketsOfDay = state.days[day]
+        const point = dayPoints.get(day)
+        if (point !== undefined) addInto(point, bucketsOfDay)
+        else dayPoints.set(day, { day, date: dayDate(day), ...bucketsOfDay })
       }
-    }
-
-    // ---- report / backup ----
-    // The report overlays the live cells over the durable table, so in-flight
-    // usage is visible immediately; live cells never outrank a newer record.
-    function mergedRecords() {
-      const records = new Map()
-      for (const pair of table.entries()) records.set(pair[0], pair[1])
-      for (const entry of liveCells) {
-        const key = entry[0]
-        const cell = entry[1]
-        const current = records.get(key)
-        if (current === undefined || cell.seq > current.seq) records.set(key, recordOf(cell))
-      }
-      return records
-    }
-    function buildReport() {
-      const totals = { sessions: 0, uncachedInputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 }
-      const dayPoints = new Map()
-      const modelRows = new Map()
-      const sessionRows = []
-      for (const record of mergedRecords().values()) {
-        try {
-          validateRecord(record)
-        } catch (error) {
-          console.error('[usage-dashboard] skipping invalid record for "' + String(record && record.id) + '": ' + String(error))
-          continue
-        }
-        const state = record.state
-        const buckets = sumDays(state.days)
-        if (isZeroBuckets(buckets) && state.turns === 0 && state.steps === 0) continue
-        totals.sessions += 1
-        addInto(totals, buckets)
-        totals.turns += state.turns
-        totals.steps += state.steps
-        totals.llmMs += state.llmMs
-        totals.toolMs += state.toolMs
-        totals.ttftMs += state.ttftMs
-        totals.ttftSteps += state.ttftSteps
-        totals.decodeMs += state.decodeMs
-        totals.decodeTokens += state.decodeTokens
-        for (const day of Object.keys(state.days)) {
-          const bucketsOfDay = state.days[day]
-          const point = dayPoints.get(day)
-          if (point !== undefined) addInto(point, bucketsOfDay)
-          else dayPoints.set(day, { day, date: dayDate(day), ...bucketsOfDay })
-        }
-        for (const model of Object.keys(state.models)) {
-          const bucketsOfModel = state.models[model]
-          const row = modelRows.get(model)
-          if (row !== undefined) {
-            addInto(row, bucketsOfModel)
-            row.sessionSet.add(record.id)
-          } else {
-            modelRows.set(model, { model, sessionSet: new Set([record.id]), ...bucketsOfModel })
-          }
-        }
-        sessionRows.push({
-          sessionId: record.id,
-          ...(record.parentSessionId !== undefined ? { parentSessionId: record.parentSessionId } : {}),
-          ...(record.origin !== undefined ? { origin: record.origin } : {}),
-          ...(state.model !== undefined ? { model: state.model } : {}),
-          turns: state.turns,
-          steps: state.steps,
-          llmMs: state.llmMs,
-          toolMs: state.toolMs,
-          ttftMs: state.ttftMs,
-          ttftSteps: state.ttftSteps,
-          decodeMs: state.decodeMs,
-          decodeTokens: state.decodeTokens,
-          firstSeen: record.firstSeen,
-          lastSeen: record.lastSeen,
-          ...buckets,
-        })
-      }
-      sessionRows.sort((left, right) => right.lastSeen - left.lastSeen)
-      const days = [...dayPoints.values()].sort((left, right) => left.date - right.date)
-      const models = [...modelRows.values()]
-        .map((row) => ({
-          model: row.model,
-          sessions: row.sessionSet.size,
-          uncachedInputTokens: row.uncachedInputTokens,
-          outputTokens: row.outputTokens,
-          cacheReadTokens: row.cacheReadTokens,
-          cacheWriteTokens: row.cacheWriteTokens,
-        }))
-        .sort((left, right) => totalOf(right) - totalOf(left))
-      return { totals, days, models, sessions: sessionRows }
-    }
-    function exportDocument() {
-      const records = []
-      for (const record of mergedRecords().values()) records.push(record)
-      return { format: BACKUP_FORMAT, version: 1, exportedAt: Date.now(), records }
-    }
-    // Backfill/repair sweep before every report: fold record-less sessions and
-    // REFOLD stored records whose fold version differs (e.g. poisoned v1
-    // records) from their own seed boundary, so the report never shows data
-    // the current fold would not have produced.
-    async function backfillUnknown() {
-      const persistence = ctx.get('sessionPersistence')
-      if (persistence === undefined) return
-      let metas
-      try {
-        metas = await persistence.list()
-      } catch (error) {
-        console.error('[usage-dashboard] persistence.list failed: ' + String(error))
-        return
-      }
-      for (const meta of metas) {
-        const key = recordKey(meta.id, meta.createdAt)
-        const existing = table.get(key)
-        if (liveCells.has(key)) continue
-        if (existing !== undefined && existing.v === FOLD_VERSION) continue
-        if (existing !== undefined && existing.v !== FOLD_VERSION) {
-          console.error('[usage-dashboard] refolding stale-version record for "' + meta.id + '"')
-        }
-        let events
-        try {
-          const read = await persistence.readFrom(meta.id, meta.seedLength || 0)
-          events = read.events
-        } catch (error) {
-          continue
-        }
-        if (!Array.isArray(events) || events.length === 0) continue
-        const cell = makeCell(meta.id, meta.createdAt, meta.cwd, meta.parentSession, meta.origin)
-        foldEvents(cell, events, Number.MAX_SAFE_INTEGER)
-        if (cell.seq < 0) continue
-        try {
-          await writeCell(key, cell)
-        } catch (error) {
-          console.error('[usage-dashboard] backfill write for "' + meta.id + '" failed: ' + String(error))
-        }
-      }
-    }
-    async function importDocument(document) {
-      if (!isPlainObject(document) || document.format !== BACKUP_FORMAT || document.version !== 1 || !Array.isArray(document.records)) {
-        throw new TypeError('usage backup document is invalid')
-      }
-      let imported = 0
-      let skipped = 0
-      for (const record of document.records) {
-        let valid = true
-        try {
-          validateRecord(record)
-        } catch (error) {
-          valid = false
-        }
-        // A backup from another fold version cannot be trusted; it is skipped
-        // whole rather than merged over current-version records.
-        if (valid && record.v !== FOLD_VERSION) valid = false
-        if (!valid) {
-          skipped += 1
-          continue
-        }
-        const key = recordKey(record.id, record.createdAt)
-        const cell = makeCell(record.id, record.createdAt, record.cwd, record.parentSessionId, record.origin)
-        adoptRecord(cell, record)
-        const written = await writeCell(key, cell)
-        if (written) {
-          imported += 1
-          const live = liveCells.get(key)
-          if (live !== undefined && live.seq < record.seq) adoptRecord(live, record)
+      for (const model of Object.keys(state.models)) {
+        const bucketsOfModel = state.models[model]
+        const row = modelRows.get(model)
+        if (row !== undefined) {
+          addInto(row, bucketsOfModel)
+          row.sessionSet.add(record.id)
         } else {
-          skipped += 1
+          modelRows.set(model, { model, sessionSet: new Set([record.id]), ...bucketsOfModel })
         }
       }
-      return { imported, skipped }
+      sessionRows.push({
+        sessionId: record.id,
+        ...(record.parentSessionId !== undefined ? { parentSessionId: record.parentSessionId } : {}),
+        ...(record.origin !== undefined ? { origin: record.origin } : {}),
+        ...(state.model !== undefined ? { model: state.model } : {}),
+        turns: state.turns,
+        steps: state.steps,
+        llmMs: state.llmMs,
+        toolMs: state.toolMs,
+        ttftMs: state.ttftMs,
+        ttftSteps: state.ttftSteps,
+        decodeMs: state.decodeMs,
+        decodeTokens: state.decodeTokens,
+        firstSeen: record.firstSeen,
+        lastSeen: record.lastSeen,
+        ...buckets,
+      })
     }
+    sessionRows.sort((left, right) => right.lastSeen - left.lastSeen)
+    const days = [...dayPoints.values()].sort((left, right) => left.date - right.date)
+    const models = [...modelRows.values()]
+      .map((row) => ({
+        model: row.model,
+        sessions: row.sessionSet.size,
+        uncachedInputTokens: row.uncachedInputTokens,
+        outputTokens: row.outputTokens,
+        cacheReadTokens: row.cacheReadTokens,
+        cacheWriteTokens: row.cacheWriteTokens,
+      }))
+      .sort((left, right) => totalOf(right) - totalOf(left))
+    return { totals, days, models, sessions: sessionRows }
+  }
+  function exportDocument() {
+    const records = []
+    for (const record of mergedRecords().values()) records.push(record)
+    return { format: BACKUP_FORMAT, version: 1, exportedAt: Date.now(), records }
+  }
+  // Light backfill for sessions the ledger has never seen (created while the
+  // plugin was stopped, or missed before the global listeners): cheap on
+  // repeat because only record-less sessions are read.
+  async function backfillUnknown() {
+    const persistence = ctx.get('sessionPersistence')
+    if (persistence === undefined) return
+    let metas
+    try {
+      metas = await persistence.list()
+    } catch (error) {
+      console.error('[usage-dashboard] persistence.list failed: ' + String(error))
+      return
+    }
+    for (const meta of metas) {
+      const key = recordKey(meta.id, meta.createdAt)
+      if (table.get(key) !== undefined || liveCells.has(key)) continue
+      let events
+      try {
+        const read = await persistence.readFrom(meta.id, meta.seedLength || 0)
+        events = read.events
+      } catch (error) {
+        continue
+      }
+      if (!Array.isArray(events) || events.length === 0) continue
+      const cell = makeCell(meta.id, meta.createdAt, meta.cwd, meta.parentSession, meta.origin)
+      foldEvents(cell, events, Number.MAX_SAFE_INTEGER)
+      if (cell.seq < 0) continue
+      try {
+        await writeCell(key, cell)
+      } catch (error) {
+        console.error('[usage-dashboard] backfill write for "' + meta.id + '" failed: ' + String(error))
+      }
+    }
+  }
+  async function importDocument(document) {
+    if (!isPlainObject(document) || document.format !== BACKUP_FORMAT || document.version !== 1 || !Array.isArray(document.records)) {
+      throw new TypeError('usage backup document is invalid')
+    }
+    let imported = 0
+    let skipped = 0
+    for (const record of document.records) {
+      let valid = true
+      try {
+        validateRecord(record)
+      } catch (error) {
+        valid = false
+      }
+      if (!valid) {
+        skipped += 1
+        continue
+      }
+      const key = recordKey(record.id, record.createdAt)
+      const cell = makeCell(record.id, record.createdAt, record.cwd, record.parentSessionId, record.origin)
+      adoptRecord(cell, record)
+      const written = await writeCell(key, cell)
+      if (written) {
+        imported += 1
+        const live = liveCells.get(key)
+        if (live !== undefined && live.seq < record.seq) adoptRecord(live, record)
+      } else {
+        skipped += 1
+      }
+    }
+    return { imported, skipped }
+  }
 
-    harness.handle('usage.report', async () => {
-      await backfillUnknown()
-      return buildReport()
-    })
-    harness.handle('usage.export', () => ({ document: exportDocument() }))
-    harness.handle('usage.import', async (args) => {
-      const document = args && typeof args === 'object' ? args.document : undefined
-      return importDocument(document)
-    })
+  // ---- HTTP API for the browser half ----
+  // The browser half is a trusted composition row, so it has no
+  // harness.handle/host.call channel (that is the dynamic-runner's private
+  // RPC). These same-origin webServer routes carry the same three verbs.
+  function jsonResponse(res, value) {
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+    res.end(JSON.stringify(value))
+  }
+  function jsonError(res, error) {
+    const message = error instanceof Error ? error.message : String(error)
+    res.writeHead(400, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+    res.end(JSON.stringify({ error: message }))
+  }
+  async function readBody(req) {
+    let size = 0
+    const chunks = []
+    for await (const chunk of req) {
+      size += chunk.length
+      if (size > 16 * 1024 * 1024) throw new Error('request body exceeds 16 MiB')
+      chunks.push(chunk)
+    }
+    return Buffer.concat(chunks).toString('utf8')
+  }
+  ctx.effect(() => webServer.register({
+    kind: 'exact',
+    path: '/usage-dashboard/report',
+    handler: async (_req, res) => {
+      try {
+        await backfillUnknown()
+        jsonResponse(res, buildReport())
+      } catch (error) {
+        jsonError(res, error)
+      }
+    },
+  }), 'usage-dashboard: report route')
+  ctx.effect(() => webServer.register({
+    kind: 'exact',
+    path: '/usage-dashboard/export',
+    handler: (_req, res) => {
+      try {
+        jsonResponse(res, { document: exportDocument() })
+      } catch (error) {
+        jsonError(res, error)
+      }
+    },
+  }), 'usage-dashboard: export route')
+  ctx.effect(() => webServer.register({
+    kind: 'exact',
+    path: '/usage-dashboard/import',
+    handler: async (req, res) => {
+      try {
+        const raw = await readBody(req)
+        const parsed = JSON.parse(raw)
+        const document = parsed && typeof parsed === 'object' ? parsed.document : undefined
+        jsonResponse(res, await importDocument(document))
+      } catch (error) {
+        jsonError(res, error)
+      }
+    },
+  }), 'usage-dashboard: import route')
 
-    await heal()
-  },
+  await heal()
 }

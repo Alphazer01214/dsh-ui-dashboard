@@ -1,9 +1,20 @@
 {
   "name": "dsh-usage-dashboard",
-  "description": "DeepSeek Harness dynamic Cordis plugin: durable cross-session usage ledger with a sidebar dashboard (per-day trend, per-model usage incl. subagents, backup export/import)",
-  "version": "1.0.0",
+  "description": "DeepSeek Harness usage dashboard as a first-class composition plugin: durable cross-session usage ledger (host) + sidebar dashboard (trusted browser half), no dynamic-plugin approval needed",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  },
   "license": "MIT",
   "repository": {
     "type": "git",
