@@ -47,6 +47,34 @@ half is `src/client.js`**, then run it and approve the browser half. The sidebar
 entry in `sidebar.footer.action`; stopping the plugin restores the built-in
 one).
 
+### Deployment auto-install (no harness code changes)
+
+To install the dashboard into a deployment so it loads automatically for every
+session, use the `autoload/` loader package and the deployment's own profile
+patch layer (under `$DSH_HOME/profiles/<profile>/`):
+
+1. Copy `autoload/` to
+   `<profile>/packages/dsh-usage-dashboard-autoload/` (package.json +
+   lib/index.js).
+2. Add
+   `"dsh-usage-dashboard-autoload": "file:./packages/dsh-usage-dashboard-autoload"`
+   to `<profile>/package.json` dependencies and run `pnpm install` in the
+   profile directory (the profile's hoisted linker puts it into
+   `profiles/node_modules`, where the loader resolves bare row names).
+3. Append to `<profile>/cordis.patch.yml`:
+
+   ```yaml
+   - insert:
+       - id: usage-dashboard-autoload
+         name: dsh-usage-dashboard-autoload
+   ```
+
+4. Restart the harness. For every **root** session the loader now defines and
+   runs the dashboard automatically (subagent children are skipped; the root
+   instance folds every session globally). The browser half still requires one
+   approval per session per process run — that is the harness's client-code
+   activation policy, and it is the only per-session step left.
+
 ## What the dialog shows
 
 - **Stat cards** — total / input / output tokens, cache-hit share, cache

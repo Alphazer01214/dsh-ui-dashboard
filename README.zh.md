@@ -21,6 +21,22 @@
 
 本插件是一个动态 Cordis 包。在 harness GUI（或 cordis API）中：定义一个包，**宿主半边粘贴 `src/host.js`，浏览器半边粘贴 `src/client.js`**，然后运行并批准浏览器半边。侧栏「用量」操作随即打开台账版仪表盘（它替换 `sidebar.footer.action` 中的内置条目；停用插件即恢复内置条目）。
 
+### 部署级自动安装（不改 harness 代码）
+
+要让仪表盘在部署中随每个会话自动加载，使用 `autoload/` 装载包并修改部署自己的 profile 补丁层（`$DSH_HOME/profiles/<profile>/` 下）：
+
+1. 把 `autoload/` 复制到 `<profile>/packages/dsh-usage-dashboard-autoload/`（package.json 与 lib/index.js）。
+2. 在 `<profile>/package.json` 的 dependencies 中加入 `"dsh-usage-dashboard-autoload": "file:./packages/dsh-usage-dashboard-autoload"`，并在 profile 目录里执行 `pnpm install`（profile 的 hoisted 链接器会把它放进 `profiles/node_modules`，loader 按裸行名解析）。
+3. 在 `<profile>/cordis.patch.yml` 追加：
+
+   ```yaml
+   - insert:
+       - id: usage-dashboard-autoload
+         name: dsh-usage-dashboard-autoload
+   ```
+
+4. 重启 harness。之后每个**根会话**都会自动定义并运行仪表盘（子代理会话被跳过；根会话实例全局折叠所有会话）。浏览器半边仍需要每个会话、每次进程运行首次批准一次——这是 harness 的客户端代码激活策略，也是唯一剩下的按会话步骤。
+
 ## 对话框内容
 
 - **统计卡片** — 总 / 输入 / 输出 Token、缓存命中率、缓存读/写、会话数、轮次、步数、LLM 与工具耗时、解码吞吐。
